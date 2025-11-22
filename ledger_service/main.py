@@ -11,7 +11,8 @@ from collections import defaultdict
 from decimal import Decimal
 
 from fastapi import FastAPI, Depends, HTTPException, status, Header, Request, Response
-from sqlalchemy.orm import Session # <--- CAMBIO: Usamos Session de SQLAlchemy
+from sqlalchemy.orm import Session
+from sqlalchemy import text # <--- CAMBIO: Usamos Session de SQLAlchemy
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 import time
 
