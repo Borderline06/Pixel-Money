@@ -262,25 +262,21 @@ async def transfer(
     idempotency_key: Optional[str] = Header(None, description="Clave única (UUID v4) para idempotencia"),
     db: Session = Depends(get_db)
 ):
-    """Procesa una transferencia BDI -> Banco Externo (ej. Happy Money)."""
+    """Procesa una transferencia BDI -> Banco Externo (Grupo Java)."""
     if idempotency_key is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Cabecera Idempotency-Key es requerida")
     
-    # Validación simple de banco destino (Simulación)
-    if req.to_bank.upper() not in ["HAPPY_MONEY", "INTERBANK", "BCP"]:
-         # Nota: Ajusta esta lista según los bancos que quieras soportar
-         pass 
-
     # 1. Verificar Idempotencia (SQL)
     if existing_tx_id := check_idempotency(db, idempotency_key):
-        logger.info(f"Transferencia duplicada (Key: {idempotency_key}). Devolviendo tx: {existing_tx_id}")
+        logger.info(f"Transferencia duplicada (Key: {idempotency_key}).")
         tx_data = get_transaction_by_id(db, existing_tx_id)
         if tx_data: return tx_data
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Error de idempotencia: Transacción original no encontrada")
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Error de idempotencia")
 
     tx_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
     
+    # Metadata inicial
     metadata = {"to_bank": req.to_bank, "destination_phone_number": req.destination_phone_number}
     status_final = "PENDING"
     currency = "PEN"
@@ -293,7 +289,7 @@ async def transfer(
             source_wallet_type="BDI",
             source_wallet_id=str(req.user_id),
             destination_wallet_type="EXTERNAL_BANK",
-            destination_wallet_id=req.destination_phone_number, # O la cuenta externa
+            destination_wallet_id=req.destination_phone_number,
             type="TRANSFER",
             amount=req.amount,
             currency=currency,
@@ -307,53 +303,16 @@ async def transfer(
 
     except Exception as e:
         db.rollback()
-        logger.error(f"Error al insertar PENDING (transfer) {tx_id}: {e}", exc_info=True)
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Error al registrar la transacción inicial")
+        logger.error(f"Error SQL inicial: {e}")
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Error al registrar transacción")
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            # A. Verificar Fondos en BDI origen
-            logger.debug(f"Tx {tx_id}: Verificando fondos para user_id {req.user_id}")
-            check_res = await client.post(
-                f"{BALANCE_SERVICE_URL}/balance/check",
-                json={"user_id": req.user_id, "amount": req.amount}
-            )
-            check_res.raise_for_status() 
-
-            # B. Llamar al Servicio Interbancario (Happy Money / Otro Grupo)
-            # NOTA: Aquí usamos la URL del otro grupo que configuraste en .env
-            logger.debug(f"Tx {tx_id}: Llamando a Interbank Service ({req.to_bank})...")
+            # A. Verificar Fondos y Bloquear (Check)
+            # (Nota: En tu lógica original hacías check y luego debit, aquí simplificamos por seguridad)
             
-            interbank_payload = {
-                "origin_bank": "PIXEL_MONEY",
-                "origin_account_id": str(req.user_id),
-                "destination_bank": req.to_bank.upper(),
-                "destination_phone_number": req.destination_phone_number,
-                "amount": req.amount,
-                "currency": currency,
-                "transaction_id": str(tx_id),
-                "description": "Transferencia desde Pixel Money"
-            }
-            # Headers requeridos por el otro grupo
-            interbank_headers = {"X-API-KEY": INTERBANK_API_KEY}
-
-            response_bank_b = await client.post(
-                f"{INTERBANK_SERVICE_URL}/interbank/transfers", # Ajustar ruta según el otro grupo
-                json=interbank_payload,
-                headers=interbank_headers
-            )
-            response_bank_b.raise_for_status() 
-
-            bank_b_response = response_bank_b.json()
-            remote_tx_id = bank_b_response.get("remote_transaction_id", "N/A")
-            
-            # Actualizamos metadata con el ID remoto
-            metadata["remote_tx_id"] = remote_tx_id
-            new_tx.metadata_info = json.dumps(metadata)
-            
-            logger.info(f"Banco externo aceptó tx {tx_id}. ID remoto: {remote_tx_id}")
-
-            # C. Debitar Saldo en BDI origen (Confirmación)
+            # B. Debitar Saldo en BDI origen (Optimista)
+            # Debitamos ANTES de enviar para asegurar fondos. Si falla el envío, hacemos rollback (reembolso).
             logger.debug(f"Tx {tx_id}: Debitando saldo de user_id {req.user_id}")
             debit_res = await client.post(
                 f"{BALANCE_SERVICE_URL}/balance/debit",
@@ -361,62 +320,88 @@ async def transfer(
             )
             debit_res.raise_for_status()
 
+            # C. Llamar al Servicio Interbancario (Grupo Java)
+            try:
+                # --- ADAPTACIÓN AL OTRO GRUPO ---
+                target_url = f"{INTERBANK_SERVICE_URL}/api/external/receive" # Su endpoint exacto
+                
+                # Su formato JSON exacto
+                java_payload = {
+                    "destination_phone_number": req.destination_phone_number,
+                    "amount": float(req.amount),
+                    "external_transaction_id": tx_id # Usamos nuestro ID como referencia externa
+                }
+                
+                # Su Header exacto
+                java_headers = {
+                    "x-wallet-b2b-key": INTERBANK_API_KEY,
+                    "Content-Type": "application/json"
+                }
+
+                logger.info(f"Enviando a JavaBank: {target_url} | Payload: {java_payload}")
+                
+                response_java = await client.post(
+                    target_url,
+                    json=java_payload,
+                    headers=java_headers
+                )
+                
+                response_java.raise_for_status() # Si ellos devuelven 4xx o 5xx, saltamos al except
+
+                # Si llegamos aquí, ellos aceptaron (200 OK)
+                logger.info(f"JavaBank respondió éxito: {response_java.status_code}")
+                
+                # Intentamos leer si nos devolvieron algún ID, si no, no pasa nada
+                try:
+                    resp_data = response_java.json()
+                    metadata["remote_response"] = resp_data
+                except:
+                    pass
+
+            except Exception as external_error:
+                # ¡FALLO EL ENVÍO! DEVOLVER EL DINERO (ROLLBACK SAGA)
+                logger.error(f"Fallo envío a JavaBank: {external_error}. Reembolsando...")
+                await client.post(
+                    f"{BALANCE_SERVICE_URL}/balance/credit",
+                    json={"user_id": req.user_id, "amount": req.amount}
+                )
+                raise external_error # Re-lanzamos para marcar como fallida en SQL
+
             # D. Todo OK
             status_final = "COMPLETED"
 
     except httpx.HTTPStatusError as e:
-        status_code = e.response.status_code
-        detail = "Error en transferencia externa"
-        try: detail = e.response.json().get("detail", e.response.text)
-        except: detail = e.response.text
-
-        if status_code == 400: status_final = "FAILED_FUNDS"
-        elif status_code == 404: status_final = "FAILED_ACCOUNT"
-        else: status_final = f"FAILED_HTTP_{status_code}"
-
-        logger.warning(f"Transferencia fallida {tx_id}: {detail}")
+        # Errores HTTP (Fondos insuficientes o rechazo del otro banco)
+        status_final = "FAILED"
+        if e.response.status_code == 400: status_final = "FAILED_FUNDS"
         
-        # Actualizar estado FAILED
+        detail = e.response.text
+        try: detail = e.response.json().get("detail", detail)
+        except: pass
+        
+        # Actualizar estado SQL
         new_tx.status = status_final
-        new_tx.updated_at = datetime.now(timezone.utc)
         new_tx.metadata_info = json.dumps(metadata)
         db.commit()
         
-        raise HTTPException(status_code=status_code, detail=detail)
+        raise HTTPException(e.response.status_code, detail=f"Error: {detail}")
 
     except Exception as e:
-        status_final = "FAILED_UNKNOWN"
-        new_tx.status = status_final
-        new_tx.updated_at = datetime.now(timezone.utc)
+        # Errores de red u otros
+        new_tx.status = "FAILED_NETWORK"
         db.commit()
-        logger.error(f"Error inesperado en tx {tx_id}: {e}", exc_info=True)
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Error interno procesando transferencia")
+        logger.error(f"Error crítico transferencia: {e}")
+        raise HTTPException(503, "El banco destino no responde. Intente más tarde.")
 
-    # Si todo fue exitoso
-    try:
-        # Guardar llave de idempotencia
-        db.add(models.IdempotencyKey(key=idempotency_key, transaction_id=tx_id))
-        
-        # Actualizar estado COMPLETED
-        new_tx.status = status_final
-        new_tx.updated_at = datetime.now(timezone.utc)
-        new_tx.metadata_info = json.dumps(metadata)
-        
-        db.commit()
-        db.refresh(new_tx)
-        
-        TRANSFER_COUNT.inc() # Métrica
-        logger.info(f"Transferencia {status_final} user {req.user_id} -> {req.to_bank}")
-        
-        return new_tx
-
-    except Exception as final_e:
-        # Error al guardar el estado final (El dinero ya se movió)
-        new_tx.status = "PENDING_CONFIRMATION"
-        db.commit()
-        logger.critical(f"¡FALLO CRÍTICO post-débito en tx {tx_id}! Error: {final_e}. Requiere reconciliación.")
-        # Devolvemos la tx aunque haya fallado el paso final de log, porque el dinero ya se envió
-        return new_tx
+    # Guardar Éxito Final
+    new_tx.status = status_final
+    new_tx.metadata_info = json.dumps(metadata)
+    db.add(models.IdempotencyKey(key=idempotency_key, transaction_id=tx_id))
+    db.commit()
+    db.refresh(new_tx)
+    
+    TRANSFER_COUNT.inc()
+    return new_tx
 
 @app.post("/contribute", response_model=schemas.Transaction, status_code=status.HTTP_201_CREATED, tags=["Transactions"])
 async def contribute_to_group(
