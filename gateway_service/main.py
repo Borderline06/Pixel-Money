@@ -47,9 +47,7 @@ origins = [
     "http://localhost",      # Para pruebas simples
     "http://localhost:3000", # Grafana (o Frontend si Grafana está apagado)
     "http://localhost:3001", # 👈 TU NUEVO PUERTO DE FRONTEND (OFICIAL)
-    "http://localhost:3002", # Por si acaso
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:3001",
+    
     "https://gateway-production-1de8.up.railway.app"
 ]
 
